@@ -1,0 +1,7 @@
+numpy>=2.4.0
+PyOpenGL>=:wq3.1.10
+PyQt6==6.10.1
+PyQt6-Qt6==6.10.1
+PyQt6_sip==13.10.3
+pyte==0.8.2
+wcwidth==0.2.14
