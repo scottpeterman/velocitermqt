@@ -7,7 +7,8 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QScrollBar, QFrame, QMessageBox
+    QLabel, QPushButton, QScrollBar, QFrame, QMessageBox,
+    QApplication
 )
 
 from .terminal_widget import TerminalWidget
@@ -26,6 +27,7 @@ class TerminalWindow(QMainWindow):
         # SSH polling timer
         self._ssh_timer = None
         self._is_ssh = False
+        self._ssh_info = None  # Store connection info
 
         # Central widget
         central = QWidget()
@@ -184,9 +186,9 @@ class TerminalWindow(QMainWindow):
             }
         """)
 
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # SSH Connection
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _open_ssh_dialog(self):
         """Open SSH connection dialog."""
@@ -217,40 +219,42 @@ class TerminalWindow(QMainWindow):
 
     def _connect_ssh(self, info):
         """Establish SSH connection."""
-        from .ssh_session import SSHSession
+        from .ssh_session import SSHSession, SSHAuthError, SSHConnectionError
         from .pty_process import PtySize
 
         size = PtySize(rows=self.terminal.rows, cols=self.terminal.cols)
 
         # Show connecting status
-        self.status_label.setText(f"Connecting to {info.display_name()}...")
+        self.status_label.setText(f"Connecting to {info.get_display_name()}...")
         self.ssh_btn.setEnabled(False)
-
-        # Process events to update UI
-        from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
 
         try:
             session = SSHSession()
 
+            # Build connection kwargs from SSHConnectionInfo
             connect_kwargs = {
                 'host': info.host,
                 'port': info.port,
                 'username': info.username,
                 'size': size,
+                'auth_method': info.auth_method,
             }
 
+            # Add auth-specific parameters
             if info.auth_method == "password":
                 connect_kwargs['password'] = info.password
             elif info.auth_method == "key":
                 connect_kwargs['key_filename'] = info.key_file
-                connect_kwargs['key_passphrase'] = info.key_passphrase
-            else:  # agent
+                if info.key_passphrase:
+                    connect_kwargs['key_passphrase'] = info.key_passphrase
+            elif info.auth_method == "agent":
                 connect_kwargs['use_agent'] = True
 
+            # Attempt connection
             session.connect(**connect_kwargs)
 
-            # Stop local PTY
+            # Success - stop local PTY
             if self.terminal._pty:
                 self.terminal._pty.terminate()
             if self.terminal._notifier:
@@ -261,6 +265,7 @@ class TerminalWindow(QMainWindow):
             self.terminal._pty = session
             self.terminal._started = True
             self._is_ssh = True
+            self._ssh_info = info
 
             # Start SSH polling timer
             if self._ssh_timer:
@@ -271,13 +276,25 @@ class TerminalWindow(QMainWindow):
 
             # Update UI
             self.terminal.buffer.clear()
-            self.terminal.buffer.feed(
-                f"Connected to {info.display_name()}\r\n".encode()
+
+            # Show connection banner
+            auth_desc = {
+                "password": "password",
+                "key": f"key ({info.key_file})" if info.key_file else "key",
+                "agent": "SSH agent"
+            }.get(info.auth_method, info.auth_method)
+
+            banner = (
+                f"\x1b[32mConnected to {info.host}:{info.port}\x1b[0m\r\n"
+                f"\x1b[90mUser: {info.username} | Auth: {auth_desc}\x1b[0m\r\n"
+                f"\x1b[90mServer: {session.get_server_banner()}\x1b[0m\r\n\r\n"
             )
-            self.setWindowTitle(f"VelociTermQt - {info.display_name()}")
-            self.connection_label.setText(info.display_name())
+            self.terminal.buffer.feed(banner.encode())
+
+            self.setWindowTitle(f"VelociTermQt - {info.get_display_name()}")
+            self.connection_label.setText(info.get_display_name())
             self.connection_label.setStyleSheet("color: #4a4; font-weight: bold;")
-            self.status_label.setText(f"Connected to {info.display_name()}")
+            self.status_label.setText(f"Connected to {info.get_display_name()}")
 
             # Show disconnect button, hide SSH button
             self.ssh_btn.setVisible(False)
@@ -285,11 +302,57 @@ class TerminalWindow(QMainWindow):
 
             self.terminal.update()
 
-        except Exception as e:
-            QMessageBox.critical(self, "Connection Failed", str(e))
+        except SSHAuthError as e:
+            self._show_auth_error(info, str(e))
+            self.status_label.setText("Authentication failed")
+
+        except SSHConnectionError as e:
+            QMessageBox.critical(
+                self, "Connection Failed",
+                f"Could not connect to {info.host}:{info.port}\n\n{e}"
+            )
             self.status_label.setText("Connection failed")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Unexpected error:\n\n{e}"
+            )
+            self.status_label.setText("Connection failed")
+
         finally:
             self.ssh_btn.setEnabled(True)
+
+    def _show_auth_error(self, info, error_msg: str):
+        """Show authentication error with helpful details."""
+        auth_help = {
+            "password": (
+                "• Check that the password is correct\n"
+                "• Verify the username is correct\n"
+                "• Some servers disable password auth"
+            ),
+            "key": (
+                "• Check that the key file exists and is readable\n"
+                "• Verify the key is authorized on the server\n"
+                "• If the key is encrypted, check the passphrase"
+            ),
+            "agent": (
+                "• Verify ssh-agent is running (ssh-add -l)\n"
+                "• Check that your key is loaded in the agent\n"
+                "• The server may not accept any of the agent keys"
+            ),
+        }
+
+        help_text = auth_help.get(info.auth_method, "")
+
+        QMessageBox.critical(
+            self, "Authentication Failed",
+            f"Could not authenticate to {info.host}\n\n"
+            f"Method: {info.auth_method}\n"
+            f"User: {info.username}\n\n"
+            f"Error: {error_msg}\n\n"
+            f"Suggestions:\n{help_text}"
+        )
 
     def _poll_ssh(self):
         """Poll SSH session for data."""
@@ -316,21 +379,24 @@ class TerminalWindow(QMainWindow):
             self.terminal._pty = None
 
         self._is_ssh = False
+        self._ssh_info = None
         self._on_ssh_disconnected()
 
         # Start local shell
         self.terminal.buffer.clear()
-        self.terminal.buffer.feed(b"SSH disconnected. Starting local shell...\r\n")
+        self.terminal.buffer.feed(b"\x1b[33mSSH disconnected.\x1b[0m\r\n")
+        self.terminal.buffer.feed(b"Starting local shell...\r\n\r\n")
         self.terminal.update()
 
         try:
             self.terminal.start()
         except Exception as e:
-            self.terminal.buffer.feed(f"Error starting shell: {e}\r\n".encode())
+            self.terminal.buffer.feed(f"\x1b[31mError starting shell: {e}\x1b[0m\r\n".encode())
 
     def _on_ssh_disconnected(self):
         """Handle SSH disconnection."""
         self._is_ssh = False
+        self._ssh_info = None
         self.setWindowTitle("VelociTermQt")
         self.connection_label.setText("Local")
         self.connection_label.setStyleSheet("color: #888;")
@@ -340,9 +406,9 @@ class TerminalWindow(QMainWindow):
         self.ssh_btn.setVisible(True)
         self.disconnect_btn.setVisible(False)
 
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # Terminal operations
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _copy_selection(self):
         """Copy selected text."""
@@ -354,7 +420,6 @@ class TerminalWindow(QMainWindow):
 
     def _paste(self):
         """Paste from clipboard."""
-        from PyQt6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         text = clipboard.text()
         if text and self.terminal._pty:
@@ -398,3 +463,53 @@ class TerminalWindow(QMainWindow):
         if self.terminal._pty:
             self.terminal._pty.terminate()
         super().closeEvent(event)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API for programmatic SSH
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def connect_ssh(self,
+                    host: str,
+                    port: int = 22,
+                    username: str = None,
+                    password: str = None,
+                    key_file: str = None,
+                    key_passphrase: str = None,
+                    auth_method: str = None):
+        """
+        Connect to SSH programmatically.
+
+        Args:
+            host: Hostname or IP
+            port: SSH port (default 22)
+            username: Username (default: current user)
+            password: Password for password auth
+            key_file: Path to private key
+            key_passphrase: Passphrase for encrypted key
+            auth_method: Explicit auth method ("password", "key", "agent")
+        """
+        from .ssh_dialog import SSHConnectionInfo
+        import os
+
+        if username is None:
+            username = os.environ.get('USER', '')
+
+        if auth_method is None:
+            if key_file:
+                auth_method = "key"
+            elif password:
+                auth_method = "password"
+            else:
+                auth_method = "agent"
+
+        info = SSHConnectionInfo(
+            host=host,
+            port=port,
+            username=username,
+            auth_method=auth_method,
+            password=password or "",
+            key_file=key_file or "",
+            key_passphrase=key_passphrase or "",
+        )
+
+        self._connect_ssh(info)

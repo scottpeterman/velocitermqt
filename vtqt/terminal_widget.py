@@ -10,10 +10,10 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QSocketNotifier, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
 
-from .text_widget import GPUTextWidget
-from .pyte_buffer import PyteTerminalBuffer
-from .pty_process import UnixPty, PtySize
-from .gpu_renderer import CursorStyle
+from vtqt.text_widget import GPUTextWidget
+from vtqt.pyte_buffer import PyteTerminalBuffer
+from vtqt.pty_process import UnixPty, PtySize
+from vtqt.gpu_renderer import CursorStyle
 
 
 class TerminalWidget(GPUTextWidget):
@@ -55,6 +55,11 @@ class TerminalWidget(GPUTextWidget):
         self._cursor_timer = QTimer(self)
         self._cursor_timer.timeout.connect(self._on_cursor_blink)
         self._cursor_timer.setInterval(self._cursor_blink_interval)
+
+        # Debounced resize refresh timer
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._on_resize_complete)
 
     def start(self, shell: str = None, cwd: str = None, env: dict = None):
         """
@@ -263,6 +268,18 @@ class TerminalWidget(GPUTextWidget):
             self.buffer.resize(self.rows, self.cols)
             self._emit_scroll_state()
 
+        # Debounce the refresh - wait for resize to settle
+        self._resize_timer.start(150)  # 150ms delay
+
+    def _on_resize_complete(self):
+        """Called after resize settles - send redraw signal."""
+        if not self._pty or not self._pty.is_alive:
+            return
+
+        # Send Ctrl+L to trigger redraw
+        # This works for both line mode (shell redraws prompt) and TUI apps (they redraw)
+        self.write(b'\x0c')  # Ctrl+L = form feed = clear/redraw
+
     def keyPressEvent(self, event: QKeyEvent):
         """Handle keyboard input - send to PTY."""
         if not self._pty or not self._pty.is_alive:
@@ -428,6 +445,7 @@ class TerminalWidget(GPUTextWidget):
     def closeEvent(self, event):
         """Clean up on widget close."""
         self._cursor_timer.stop()
+        self._resize_timer.stop()
         if self._notifier:
             self._notifier.setEnabled(False)
         if self._pty:

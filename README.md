@@ -26,7 +26,15 @@ A PyQt6 terminal emulator using OpenGL for GPU-accelerated text rendering. Part 
 - **Scrollback history** - 10k lines with selection across history boundary
 - **Flicker-free rendering** - GPU double-buffering eliminates tearing
 - **SSH support** - Paramiko integration with password/key/agent auth
-- **Connection dialog** - Recent connections history, key file browser
+- **Connection dialog** - Session tree, credential lookup, auth override
+
+### Session 3 ✓ - Session & Credential Management
+- **Session Manager** - Full CRUD for sessions organized in folders
+- **Credential Manager** - Reusable credentials with password/key/agent auth
+- **YAML Configuration** - Human-editable config files in `~/.velocitermqt/`
+- **Layered Auth Resolution** - Session → Credential → Override → Connect
+- **Device Metadata** - Vendor, model, device type for network equipment
+- **Context Menus** - Right-click edit/delete on session tree
 
 ### What Works Now
 ```
@@ -44,10 +52,13 @@ A PyQt6 terminal emulator using OpenGL for GPU-accelerated text rendering. Part 
 ✅ Paste                # Ctrl+Shift+V
 ✅ Mouse wheel scroll   # Smooth scrollback navigation
 ✅ SSH connections      # Password, key file, or SSH agent auth
-✅ Recent connections   # Saved connection history
+✅ Session management   # Folders, device info, credential binding
+✅ Credential storage   # Reusable auth configs
+✅ Auth override        # Per-connection credential override
 ```
 
 ### Known Limitations
+- [ ] Passwords stored in plaintext (encryption planned)
 - [ ] Windows ConPTY not implemented
 - [ ] No mouse reporting to applications (vim mouse mode, tmux)
 - [ ] No OSC sequences (hyperlinks, window title, clipboard)
@@ -89,12 +100,24 @@ A PyQt6 terminal emulator using OpenGL for GPU-accelerated text rendering. Part 
 └──────────────────┘  └──────────────────┘  └──────────────────────┘
                                 │
                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      SSH & Session Layer                        │
+├──────────────────┬──────────────────┬───────────────────────────┤
+│  ssh_dialog.py   │ session_manager  │  credential_manager.py    │
+│  Connection UI   │ .py              │  Credential CRUD          │
+│  - Session tree  │ Session CRUD     │  - Password/Key/Agent     │
+│  - Auth override │ - Folders        │  - Visibility toggle      │
+│  - Live summary  │ - Device info    │                           │
+└──────────────────┴──────────────────┴───────────────────────────┘
+                                │
+                                ▼
                      ┌──────────────────┐
-                     │  ssh_dialog.py   │
-                     │  Connection UI   │
-                     │  - Host/port     │
-                     │  - Auth methods  │
-                     │  - Recent list   │
+                     │ config_manager   │
+                     │ .py              │
+                     │ - sessions.yaml  │
+                     │ - credentials    │
+                     │   .yaml          │
+                     │ - settings.yaml  │
                      └──────────────────┘
 ```
 
@@ -119,6 +142,103 @@ A PyQt6 terminal emulator using OpenGL for GPU-accelerated text rendering. Part 
 │ - 38;5;N (256)  │                 │                 │
 │ - 48;2;R;G;B    │                 │                 │
 └─────────────────┘                 └─────────────────┘
+```
+
+### Authentication Flow
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Session    │     │  Credential  │     │   Override   │
+│              │     │  (credsid)   │     │   (dialog)   │
+│ - host       │     │              │     │              │
+│ - port       │     │ - username   │     │ - username   │
+│ - username?  │ ──▶ │ - auth_method│ ──▶ │ - password   │
+│ - credsid    │     │ - password   │     │ - key_file   │
+│              │     │ - key_file   │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+                                                 │
+                                                 ▼
+                                    ┌────────────────────┐
+                                    │  SSHConnectionInfo │
+                                    │  (final resolved)  │
+                                    │                    │
+                                    │  → SSHSession      │
+                                    │    .connect()      │
+                                    └────────────────────┘
+
+Resolution Rules:
+- Each layer overrides only if it has a value
+- Empty password = Paramiko tries agent/keys or prompts
+- Empty key_file = Paramiko tries ~/.ssh/id_*
+- Auth method "agent" = agent + default keys
+```
+
+---
+
+## Configuration Files
+
+All configuration lives in `~/.velocitermqt/`:
+
+### sessions.yaml
+```yaml
+- folder_name: Production
+  sessions:
+    - display_name: Core Router
+      host: 10.0.0.1
+      port: "22"
+      DeviceType: cisco_ios
+      Vendor: Cisco
+      Model: ISR4451
+      credsid: "1"
+    - display_name: Edge Switch
+      host: 10.0.0.2
+      port: "22"
+      DeviceType: arista_eos
+      Vendor: Arista
+      Model: 7050X
+
+- folder_name: Lab
+  sessions:
+    - display_name: Test Server
+      host: lab-server.local
+      port: "22"
+      DeviceType: linux
+      username: admin  # Direct auth, no credential
+```
+
+### credentials.yaml
+```yaml
+- id: "1"
+  name: Network Admin
+  username: netadmin
+  auth_method: key
+  key_file: ~/.ssh/network_ed25519
+
+- id: "2"
+  name: Root Access
+  username: root
+  auth_method: password
+  password: changeme  # TODO: encrypt this
+
+- id: "3"
+  name: SSH Agent
+  username: speterman
+  auth_method: agent
+```
+
+### settings.yaml
+```yaml
+font_family: monospace
+font_size: 14
+cursor_style: block
+cursor_blink: true
+cursor_blink_ms: 530
+foreground: "#d4d4d4"
+background: "#1e1e1e"
+selection: "#264f78"
+scrollback_lines: 10000
+window_width: 800
+window_height: 600
 ```
 
 ---
@@ -150,6 +270,13 @@ pyte doesn't natively support 256-color or true color. We patched `FixedHistoryS
 - Terminal widget doesn't know/care if it's local or remote
 - Polling timer (10ms) instead of QSocketNotifier for SSH
 
+### Credential Layering
+Auth resolution is deliberately permissive:
+- Empty password → try agent/keys, or server prompts
+- Empty key file → try default `~/.ssh/id_*` locations
+- Override only replaces values that are explicitly set
+- Warnings shown but don't block connection
+
 ### Cursor Rendering
 Three-pass GPU rendering:
 1. Background colors (solid quads)
@@ -176,9 +303,13 @@ vtqt/
 ├── terminal_window.py    # Terminal mode main window + SSH button
 ├── main_window.py        # File viewer mode main window
 │
-├── pty_process.py        # Unix PTY + SSHSession (same interface)
-├── ssh_session.py        # Paramiko SSH wrapper
-├── ssh_dialog.py         # SSH connection dialog UI
+├── pty_process.py        # Unix PTY wrapper
+├── ssh_session.py        # Paramiko SSH wrapper (same interface as PTY)
+├── ssh_dialog.py         # SSH connection dialog with session tree
+│
+├── config_manager.py     # YAML config loading/saving
+├── session_manager.py    # Session CRUD dialog
+├── credential_manager.py # Credential CRUD dialog
 │
 └── vterm_wrapper.py      # libvterm bindings (tested, not used)
 ```
@@ -192,7 +323,7 @@ git clone <repo>
 cd velocitermqt
 python -m venv .venv
 source .venv/bin/activate
-pip install PyQt6 PyOpenGL numpy pyte paramiko
+pip install PyQt6 PyOpenGL numpy pyte paramiko pyyaml
 python -m vtqt.main
 ```
 
@@ -203,7 +334,8 @@ python -m vtqt.main
 | PyOpenGL | OpenGL bindings |
 | numpy | Render array packing |
 | pyte | Terminal emulation |
-| paramiko | SSH connections (optional) |
+| paramiko | SSH connections |
+| pyyaml | Configuration files |
 
 ---
 
@@ -229,15 +361,27 @@ python -m vtqt.main somefile.py
 
 ### SSH Connection
 1. Click **SSH Connect** button in toolbar
-2. Enter host, port, username
-3. Choose auth method:
-   - **Password** - enter password
-   - **Key File** - browse to private key, optional passphrase
-   - **SSH Agent** - uses keys from running ssh-agent
-4. Click **Connect**
-5. Use **Disconnect** button to return to local shell
+2. **Sessions tab**: Select from saved sessions
+   - Sessions organized in folders
+   - Device details shown on selection
+   - Double-click to connect immediately
+3. **Manual tab**: Enter connection details directly
+4. **Auth Override**: Check to override credential settings
+5. Click **Connect**
 
-Recent connections are saved and available in the **Recent** tab.
+### Managing Sessions
+1. Click **📝 Sessions...** button in SSH dialog
+2. Add/edit/delete sessions and folders
+3. Assign credentials to sessions via `credsid`
+4. Device info (vendor, model, type) is optional
+
+### Managing Credentials
+1. Click **🔑 Credentials...** button in SSH dialog
+2. Create reusable auth configurations:
+   - **Password**: Username + password
+   - **Key File**: Username + private key path + optional passphrase
+   - **SSH Agent**: Username only (keys from ssh-agent)
+3. Reference credentials in sessions by ID
 
 ---
 
@@ -245,10 +389,11 @@ Recent connections are saved and available in the **Recent** tab.
 
 ### Phase 3: Polish
 - [x] Cursor rendering (blinking block/bar/underline)
+- [x] Session/credential management
+- [ ] Encrypted credential storage
 - [ ] Font selector in toolbar
 - [ ] Double-click word selection
 - [ ] Triple-click line selection
-- [ ] Debounced resize handling
 
 ### Phase 4: Features
 - [ ] Search in scrollback (Ctrl+Shift+F)
@@ -271,6 +416,7 @@ Recent connections are saved and available in the **Recent** tab.
 
 ### Phase 7: Integration
 - [x] SSH session support (paramiko backend)
+- [x] Session/credential management
 - [ ] Embeddable widget API for Velocity* tools
 - [ ] Serial port support
 - [ ] Telnet support
@@ -301,6 +447,22 @@ for i in {0..255}; do printf '\e[48;5;%dm %3d' $i $i; (( (i+1) % 16 == 0 )) && e
 # True color gradient
 awk 'BEGIN{for(i=0;i<256;i++)printf "\033[48;2;%d;0;0m \033[0m",i; print ""}'
 ```
+
+---
+
+## Security Notes
+
+⚠️ **Credentials are stored in plaintext** in `~/.velocitermqt/credentials.yaml`
+
+Current mitigations:
+- File created with mode 0600 (owner read/write only)
+- Passwords can be left empty (server will prompt)
+- SSH agent auth recommended for key-based access
+
+Planned improvements:
+- Keyring integration (GNOME Keyring, macOS Keychain, Windows Credential Manager)
+- Optional encryption with master password
+- Memory-only credential option (never written to disk)
 
 ---
 
@@ -354,3 +516,4 @@ MIT
 |---------|------|-----------------|
 | 1 | 2025-01-07 | GPU rendering PoC, glyph atlas, scrolling, selection |
 | 2 | 2025-01-08 | Terminal emulation, 256/true color, cursor, SSH support |
+| 3 | 2025-01-08 | Session/credential management, auth flow, YAML config |

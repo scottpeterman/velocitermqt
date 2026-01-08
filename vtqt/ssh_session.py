@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import queue
+import socket
 from typing import Optional, List, Dict
 from dataclasses import dataclass
 
@@ -22,6 +23,16 @@ except ImportError:
     paramiko = None
 
 from .pty_process import PtyProcess, PtySize
+
+
+class SSHAuthError(Exception):
+    """SSH authentication failed."""
+    pass
+
+
+class SSHConnectionError(Exception):
+    """SSH connection failed."""
+    pass
 
 
 class SSHSession(PtyProcess):
@@ -60,7 +71,9 @@ class SSHSession(PtyProcess):
 
         # Connection info (for display)
         self._host = ""
+        self._port = 22
         self._username = ""
+        self._auth_method = ""
 
     def connect(self,
                 host: str,
@@ -71,7 +84,8 @@ class SSHSession(PtyProcess):
                 key_passphrase: str = None,
                 use_agent: bool = False,
                 timeout: float = 10.0,
-                size: PtySize = None) -> bool:
+                size: PtySize = None,
+                auth_method: str = None) -> bool:
         """
         Connect to SSH server.
 
@@ -85,9 +99,14 @@ class SSHSession(PtyProcess):
             use_agent: Use SSH agent for authentication
             timeout: Connection timeout in seconds
             size: Initial terminal size
+            auth_method: Explicit auth method ("password", "key", "agent")
 
         Returns:
             True if connection successful
+
+        Raises:
+            SSHAuthError: Authentication failed
+            SSHConnectionError: Connection failed
         """
         if self._connected:
             self.close()
@@ -99,41 +118,93 @@ class SSHSession(PtyProcess):
             size = PtySize(rows=24, cols=80)
 
         self._host = host
+        self._port = port
         self._username = username
+
+        # Determine auth method if not explicit
+        if auth_method is None:
+            if key_filename:
+                auth_method = "key"
+            elif use_agent:
+                auth_method = "agent"
+            elif password:
+                auth_method = "password"
+            else:
+                auth_method = "agent"  # Default fallback
+
+        self._auth_method = auth_method
 
         try:
             self._client = SSHClient()
             self._client.set_missing_host_key_policy(AutoAddPolicy())
 
-            # Build auth kwargs
+            # Build connection kwargs based on auth method
             connect_kwargs = {
                 'hostname': host,
                 'port': port,
                 'username': username,
                 'timeout': timeout,
-                'allow_agent': use_agent,
-                'look_for_keys': use_agent,  # Only look for keys if using agent
+                'allow_agent': False,
+                'look_for_keys': False,
             }
 
-            if password:
-                connect_kwargs['password'] = password
+            if auth_method == "password":
+                # Password can be empty - Paramiko will prompt if server requires it
+                # But we need to provide SOMETHING or Paramiko won't try password auth
+                if password:
+                    connect_kwargs['password'] = password
+                else:
+                    # Enable keyboard-interactive which can prompt for password
+                    # Also try agent/keys as fallback
+                    connect_kwargs['allow_agent'] = True
+                    connect_kwargs['look_for_keys'] = True
 
-            if key_filename:
-                key_filename = os.path.expanduser(key_filename)
-                connect_kwargs['key_filename'] = key_filename
-                if key_passphrase:
-                    connect_kwargs['passphrase'] = key_passphrase
-                connect_kwargs['look_for_keys'] = False
+            elif auth_method == "key":
+                if key_filename:
+                    key_filename = os.path.expanduser(key_filename)
+                    if not os.path.isfile(key_filename):
+                        raise SSHAuthError(f"Key file not found: {key_filename}")
+                    connect_kwargs['key_filename'] = key_filename
+                    if key_passphrase:
+                        connect_kwargs['passphrase'] = key_passphrase
+                else:
+                    # No specific key - try default locations (~/.ssh/id_*)
+                    connect_kwargs['look_for_keys'] = True
+                # Also try agent as fallback
+                connect_kwargs['allow_agent'] = True
 
-            # Connect
-            self._client.connect(**connect_kwargs)
+            elif auth_method == "agent":
+                connect_kwargs['allow_agent'] = True
+                connect_kwargs['look_for_keys'] = True  # Also try default keys
+
+            else:
+                raise SSHAuthError(f"Unknown auth method: {auth_method}")
+
+            # Connect with timeout
+            try:
+                self._client.connect(**connect_kwargs)
+            except paramiko.AuthenticationException as e:
+                raise SSHAuthError(f"Authentication failed: {e}")
+            except paramiko.SSHException as e:
+                raise SSHConnectionError(f"SSH protocol error: {e}")
+            except socket.timeout:
+                raise SSHConnectionError(f"Connection timed out after {timeout}s")
+            except socket.gaierror as e:
+                raise SSHConnectionError(f"Could not resolve hostname: {host}")
+            except socket.error as e:
+                raise SSHConnectionError(f"Network error: {e}")
+            except Exception as e:
+                raise SSHConnectionError(f"Connection failed: {e}")
 
             # Open interactive shell channel
-            self._channel = self._client.invoke_shell(
-                term='xterm-256color',
-                width=size.cols,
-                height=size.rows
-            )
+            try:
+                self._channel = self._client.invoke_shell(
+                    term='xterm-256color',
+                    width=size.cols,
+                    height=size.rows
+                )
+            except paramiko.SSHException as e:
+                raise SSHConnectionError(f"Could not open shell: {e}")
 
             # Set non-blocking
             self._channel.setblocking(0)
@@ -142,19 +213,37 @@ class SSHSession(PtyProcess):
             self._stop_event.clear()
             self._read_thread = threading.Thread(
                 target=self._read_worker,
-                daemon=True
+                daemon=True,
+                name=f"ssh-reader-{host}"
             )
             self._read_thread.start()
 
             self._connected = True
             return True
 
-        except paramiko.AuthenticationException as e:
-            raise ConnectionError(f"Authentication failed: {e}")
-        except paramiko.SSHException as e:
-            raise ConnectionError(f"SSH error: {e}")
+        except (SSHAuthError, SSHConnectionError):
+            # Re-raise our custom exceptions
+            self._cleanup_failed_connection()
+            raise
         except Exception as e:
-            raise ConnectionError(f"Connection failed: {e}")
+            self._cleanup_failed_connection()
+            raise SSHConnectionError(f"Unexpected error: {e}")
+
+    def _cleanup_failed_connection(self):
+        """Clean up after a failed connection attempt."""
+        if self._channel:
+            try:
+                self._channel.close()
+            except Exception:
+                pass
+            self._channel = None
+
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     def _read_worker(self):
         """Background thread to read from channel."""
@@ -180,9 +269,9 @@ class SSHSession(PtyProcess):
             except Exception:
                 self._exit_code = -1
 
-    # ─────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
     # PtyProcess interface implementation
-    # ─────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
 
     def spawn(self,
               argv: List[str],
@@ -284,7 +373,9 @@ class SSHSession(PtyProcess):
             return False
 
         try:
-            # Check if channel is still open
+            transport = self._channel.get_transport()
+            if transport is None or not transport.is_active():
+                return False
             return not self._channel.closed
         except Exception:
             return False
@@ -314,9 +405,9 @@ class SSHSession(PtyProcess):
                 pass
         return -1
 
-    # ─────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
     # SSH-specific properties
-    # ─────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────────────────
 
     @property
     def host(self) -> str:
@@ -324,14 +415,49 @@ class SSHSession(PtyProcess):
         return self._host
 
     @property
+    def port(self) -> int:
+        """Connected port."""
+        return self._port
+
+    @property
     def username(self) -> str:
         """Connected username."""
         return self._username
 
     @property
+    def auth_method(self) -> str:
+        """Authentication method used."""
+        return self._auth_method
+
+    @property
     def connection_string(self) -> str:
         """User-friendly connection string."""
-        return f"{self._username}@{self._host}"
+        port_str = f":{self._port}" if self._port != 22 else ""
+        return f"{self._username}@{self._host}{port_str}"
+
+    def get_server_banner(self) -> str:
+        """Get SSH server banner if available."""
+        if self._client:
+            try:
+                transport = self._client.get_transport()
+                if transport:
+                    return transport.remote_version or ""
+            except Exception:
+                pass
+        return ""
+
+    def get_host_key_type(self) -> str:
+        """Get the type of host key used."""
+        if self._client:
+            try:
+                transport = self._client.get_transport()
+                if transport:
+                    key = transport.get_remote_server_key()
+                    if key:
+                        return key.get_name()
+            except Exception:
+                pass
+        return ""
 
     def __del__(self):
         """Ensure cleanup on garbage collection."""
@@ -343,12 +469,12 @@ def check_paramiko_available() -> bool:
     return HAS_PARAMIKO
 
 
-def get_ssh_agent_keys() -> List[str]:
+def get_ssh_agent_keys() -> List[Dict[str, str]]:
     """
     Get list of keys available from SSH agent.
 
     Returns:
-        List of key fingerprints/comments
+        List of dicts with 'type', 'fingerprint', 'comment'
     """
     if not HAS_PARAMIKO:
         return []
@@ -359,8 +485,79 @@ def get_ssh_agent_keys() -> List[str]:
         result = []
         for key in keys:
             fingerprint = key.get_fingerprint().hex()
-            name = key.get_name()
-            result.append(f"{name} {fingerprint[:16]}...")
+            # Format fingerprint nicely
+            fp_formatted = ':'.join(fingerprint[i:i+2] for i in range(0, len(fingerprint), 2))
+            result.append({
+                'type': key.get_name(),
+                'fingerprint': fp_formatted,
+                'bits': key.get_bits(),
+            })
         return result
     except Exception:
         return []
+
+
+def test_connection(host: str,
+                   port: int = 22,
+                   username: str = None,
+                   password: str = None,
+                   key_filename: str = None,
+                   key_passphrase: str = None,
+                   use_agent: bool = False,
+                   timeout: float = 5.0) -> tuple[bool, str]:
+    """
+    Test SSH connection without opening a shell.
+
+    Returns:
+        (success: bool, message: str)
+    """
+    if not HAS_PARAMIKO:
+        return False, "paramiko not installed"
+
+    if username is None:
+        username = os.environ.get('USER', 'root')
+
+    try:
+        client = SSHClient()
+        client.set_missing_host_key_policy(AutoAddPolicy())
+
+        connect_kwargs = {
+            'hostname': host,
+            'port': port,
+            'username': username,
+            'timeout': timeout,
+            'allow_agent': use_agent,
+            'look_for_keys': use_agent,
+        }
+
+        if password:
+            connect_kwargs['password'] = password
+
+        if key_filename:
+            connect_kwargs['key_filename'] = os.path.expanduser(key_filename)
+            if key_passphrase:
+                connect_kwargs['passphrase'] = key_passphrase
+            connect_kwargs['look_for_keys'] = False
+
+        client.connect(**connect_kwargs)
+
+        # Get server info
+        transport = client.get_transport()
+        server_version = transport.remote_version if transport else "unknown"
+
+        client.close()
+
+        return True, f"Connected successfully. Server: {server_version}"
+
+    except paramiko.AuthenticationException as e:
+        return False, f"Authentication failed: {e}"
+    except paramiko.SSHException as e:
+        return False, f"SSH error: {e}"
+    except socket.timeout:
+        return False, f"Connection timed out"
+    except socket.gaierror:
+        return False, f"Could not resolve hostname: {host}"
+    except socket.error as e:
+        return False, f"Network error: {e}"
+    except Exception as e:
+        return False, f"Error: {e}"
